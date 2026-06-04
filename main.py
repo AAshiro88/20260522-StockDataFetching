@@ -354,7 +354,7 @@ def fetch(state: StockState) -> tuple[dict, list[str]]:
             bid_prices = parse_five(i.get("b", ""))
             bid_vols   = parse_five(i.get("g", ""))
             ask_prices = parse_five(i.get("f", ""))
-            ask_vols   = parse_five(i.get("f", ""))
+            ask_vols   = parse_five(i.get("g", ""))
 
             prev_tick = state._prev_tick_price.get(c, 0)
             if prev_tick > 0 and price > 0:
@@ -628,13 +628,15 @@ class StockApp:
         self.state = state
         
         self.root.title("即時報價監控系統")
-        # 修正：將視窗預設寬度調整至 1100，配合最高、最低欄位的定位點
         self.root.geometry("1100x800")
         self.root.configure(bg="#1e1e1e")
         
         # 使用等寬字型確保表格基本字形一致
         self.display_font = tkfont.Font(family="Courier New", size=11, weight="bold")
         self.header_font = tkfont.Font(family="Microsoft JhengHei", size=11, weight="bold")
+        
+        # 計算當前螢幕與字型配置下的基礎字寬（動態對齊關鍵）
+        char_width = self.display_font.measure("0")
         
         # 頂部狀態列
         self.status_frame = tk.Frame(root, bg="#2d2d2d", padx=10, pady=5)
@@ -658,7 +660,7 @@ class StockApp:
         self.scrollbar = tk.Scrollbar(self.main_frame)
         self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # 修正：擴充定位點以容納最高、最低價欄位，並將 -yaxiscommand 修正為正確的 yscrollcommand 參數
+        # 修正：改用動態計算的字寬單位設定 tabs，完美適應不同高解析度與 DPI 的電腦螢幕
         self.text_area = tk.Text(
             self.main_frame, 
             font=self.display_font, 
@@ -668,7 +670,13 @@ class StockApp:
             wrap=tk.NONE,
             bd=0,
             highlightthickness=0,
-            tabs=(360, "right", 460, "right", 560, "right", 660, "right", 760, "right", 860, "right")
+            tabs=(
+                char_width * 34, "right", 
+                char_width * 46, "right", 
+                char_width * 58, "right", 
+                char_width * 70, "right", 
+                char_width * 82, "right"
+            )
         )
         self.text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.scrollbar.config(command=self.text_area.yview)
@@ -703,7 +711,15 @@ class StockApp:
             csv_interval = 60      # 每 1 分鐘更新即時報價 CSV
             excel_interval = 600   # 剩下的歷史分頁隔久一點，每 10 分鐘更新一次
 
+        # 調整初次觸發機制，讓系統啟動時能立刻有第一筆初始快取，不需乾等 10 秒
+            refresh(self.state)
+            trigger_csv_write(self.state)
+            trigger_sheet_write(self.state)
+            last_csv_time = time.time()
+            last_excel_time = time.time()
+
             while True:
+                time.sleep(10)
                 refresh(self.state)
                 current_now = time.time()
                 
@@ -716,8 +732,6 @@ class StockApp:
                 if current_now - last_excel_time >= excel_interval:
                     trigger_sheet_write(self.state)
                     last_excel_time = current_now
-                    
-                time.sleep(10)
         
         t = threading.Thread(target=_loop, daemon=True)
         t.start()
