@@ -12,10 +12,9 @@ from datetime import datetime, timezone, timedelta
 import tkinter as tk
 from tkinter import font as tkfont
 
-# --- 本地 Excel 處理 --------------------------
+# --- 本地 Excel 設定檔（唯讀，程式永不寫入）---
 
 import openpyxl
-from openpyxl.utils import get_column_letter
 
 # --- 時間設定 --------------------------------
 
@@ -31,10 +30,11 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-EXCEL_FILE = os.path.join(BASE_DIR, "個股股價.xlsx")
+MAIN_XLSX = os.path.join(BASE_DIR, "main.xlsx")
+HISTORY_CSV_DIR = os.path.join(BASE_DIR, "個股股價")
 CSV_FILE = os.path.join(BASE_DIR, "即時報價.csv")
 
-# --- 股票與 ETF 清單（從 Excel main 工作表載入）---
+# --- 股票與 ETF 清單（從 main.xlsx 唯讀載入）---
 
 WATCH_LIST: list[str] = []
 ETF_CODES: set[str] = set()
@@ -89,11 +89,11 @@ class StockState:
         self.local_time: str = ""
         self.twse_time: str | None = None
         self.error: str = ""
+        self.bad_codes: list[str] = []
 
         self._price_cache: dict[str, float] = {}
         self._y_cache: dict[str, float] = {}
         self._history_row_cache: dict[str, list] = {}
-        self._sheet_meta_cache: dict[str, dict] = {}
         self._sheet_lock = threading.Lock()
         self._sheet_writing = False
         self._csv_lock = threading.Lock()
@@ -107,88 +107,28 @@ class StockState:
 
         self._industry_cache: dict[str, str] = {}
 
-        # 修正：初始化期間的 I/O 錯誤分開捕捉，避免前者靜默失敗導致後者讀到殘缺資料
-        init_ok = self._init_excel_file()
-        if init_ok:
-            self._load_industry_mapping()
-            self._load_main_config()
+        self._init_data_files()
+        self._load_main_config()
+        self._load_industry_mapping()
 
-    def _init_excel_file(self) -> bool:
-        """初始化本地 Excel 檔案，確保其存在且有效，回傳是否成功"""
-        if os.path.exists(EXCEL_FILE):
-            try:
-                wb = openpyxl.load_workbook(EXCEL_FILE)
-                wb.close()
-                return True
-            except Exception:
-                pass
-            os.remove(EXCEL_FILE)
-        try:
+    def _init_data_files(self):
+        """初始化資料檔（唯讀，永不寫入現有檔案）"""
+        os.makedirs(HISTORY_CSV_DIR, exist_ok=True)
+        if not os.path.exists(MAIN_XLSX):
             wb = openpyxl.Workbook()
-            default_sheet = wb.active
-            wb.remove(default_sheet)
-            wb.save(EXCEL_FILE)
+            ws = wb.active
+            ws.title = "main"
+            ws.append(["股號", "ETF代碼", "高亮股號"])
+            wb.save(MAIN_XLSX)
             wb.close()
-        except Exception as e:
-            self.error = f"初始化 Excel 檔案失敗: {e}"
-            return False
-        return True
-
-    def _load_industry_mapping(self):
-        """從本地 Excel 讀取產業別對照表"""
-        try:
-            if not os.path.exists(EXCEL_FILE):
-                return
-            wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True)
-            if "本國上市證券國際證券辨識號碼一覽表" not in wb.sheetnames:
-                wb.close()
-                return
-            
-            ws = wb["本國上市證券國際證券辨識號碼一覽表"]
-            all_values = []
-            for row in ws.iter_rows(values_only=True):
-                all_values.append(list(row))
-            wb.close()
-
-            if len(all_values) <= 4:
-                return
-
-            header = all_values[4]
-
-            code_idx = -1
-            industry_idx = -1
-            for idx, name in enumerate(header):
-                if name and "有價證券代號及名稱" in str(name):
-                    code_idx = idx
-                elif name and "產業別" in str(name):
-                    industry_idx = idx
-
-            if code_idx == -1: code_idx = 0
-            if industry_idx == -1: industry_idx = 4
-
-            for row in all_values[5:]:
-                if len(row) <= max(code_idx, industry_idx):
-                    continue
-
-                raw_code_name = str(row[code_idx]).strip() if row[code_idx] else ""
-                industry = str(row[industry_idx]).strip() if row[industry_idx] else ""
-
-                if raw_code_name and industry:
-                    parts = raw_code_name.replace(' ', ' ').split()
-                    if parts:
-                        code = parts[0].strip()
-                        if code.isdigit():
-                            self._industry_cache[code] = industry
-        except Exception as e:
-            self.error = f"載入產業別一覽表失敗: {e}"
 
     def _load_main_config(self):
-        """從 Excel main 工作表讀取個股/ETF/高亮清單"""
+        """從 main.xlsx 唯讀載入設定（可用 Excel 編輯 main.xlsx）"""
         global WATCH_LIST, ETF_CODES, HIGHLIGHT_STOCKS
         try:
-            if not os.path.exists(EXCEL_FILE):
+            if not os.path.exists(MAIN_XLSX):
                 return
-            wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True)
+            wb = openpyxl.load_workbook(MAIN_XLSX, read_only=True)
             if "main" not in wb.sheetnames:
                 wb.close()
                 return
@@ -216,27 +156,54 @@ class StockState:
         except Exception as e:
             self.error = f"載入 main 設定表失敗: {e}"
 
+    def _load_industry_mapping(self):
+        """從 main.xlsx 讀取產業別對照表"""
+        try:
+            if not os.path.exists(MAIN_XLSX):
+                return
+            wb = openpyxl.load_workbook(MAIN_XLSX, read_only=True)
+            sheet_name = None
+            for name in wb.sheetnames:
+                if "一覽表" in name:
+                    sheet_name = name
+                    break
+            if not sheet_name:
+                wb.close()
+                return
+            ws = wb[sheet_name]
+            all_values = []
+            for row in ws.iter_rows(values_only=True):
+                all_values.append(list(row))
+            wb.close()
+            if len(all_values) <= 4:
+                return
+            header = all_values[4]
+            code_idx, industry_idx = -1, -1
+            for idx, name in enumerate(header):
+                if name and "有價證券代號及名稱" in str(name):
+                    code_idx = idx
+                elif name and "產業別" in str(name):
+                    industry_idx = idx
+            if code_idx == -1: code_idx = 0
+            if industry_idx == -1: industry_idx = 4
+            for row in all_values[5:]:
+                if len(row) <= max(code_idx, industry_idx):
+                    continue
+                raw = str(row[code_idx]).strip() if row[code_idx] else ""
+                ind = str(row[industry_idx]).strip() if row[industry_idx] else ""
+                if raw and ind:
+                    parts = raw.replace("\u3000", " ").split()
+                    if parts:
+                        code = parts[0].strip()
+                        if code.isdigit():
+                            self._industry_cache[code] = ind
+        except Exception as e:
+            self.error = f"載入產業別對照表失敗: {e}"
+
     def get_industry(self, code: str) -> str:
         return self._industry_cache.get(code, "其他業")
 
-    def get_worksheet(self, wb: openpyxl.Workbook, sheet_name: str, stock_name: str = "") -> openpyxl.worksheet.worksheet.Worksheet:
-        """獲取或建立指定工作表"""
-        if sheet_name in wb.sheetnames:
-            return wb[sheet_name]
-        
-        ws = wb.create_sheet(title=sheet_name)
-        ws.append([stock_name])
-        ws.append(["日期", "開盤價", "最高價", "最低價", "收盤價", "漲跌", "漲跌幅(%)"])
-        return ws
 
-    def get_sheet_meta(self, ws: openpyxl.worksheet.worksheet.Worksheet, today: str) -> dict:
-        """讀取工作表最後一行日期資料"""
-        max_row = ws.max_row
-        if max_row <= 2:
-            return {"date": None, "row": 3}
-        
-        last_date_val = ws.cell(row=max_row, column=1).value
-        return {"date": str(last_date_val) if last_date_val else None, "row": max_row}
 
 
 # --- 資料抓取 --------------------------------
@@ -270,134 +237,143 @@ def fetch(state: StockState) -> tuple[dict, list[str]]:
         prefix = "otc" if i["code"].startswith("o") else "tse"
         index_ex_list.append(f"{prefix}_{i['code']}.tw")
 
-    ex = "|".join(
-        [f"tse_{c}.tw|otc_{c}.tw" for c in combined_watch_list]
-        + index_ex_list
-    )
+    batch_size = 50
+    batches = [combined_watch_list[i:i+batch_size]
+               for i in range(0, len(combined_watch_list), batch_size)]
 
     try:
-        time.sleep(random.uniform(0.2, 0.5))
-        r = requests.get(
-            URL,
-            params={"ex_ch": ex, "json": 1, "delay": 0},
-            headers=HEADERS,
-            timeout=10,
-        )
+        for batch_idx, batch in enumerate(batches):
+            time.sleep(random.uniform(0.2, 0.5))
 
-        if r.status_code != 200:
-            state.error = f"抓取失敗: 證交所拒絕連線 (HTTP {r.status_code})"
-            return result, twse_times
+            ex = "|".join(
+                [f"tse_{c}.tw|otc_{c}.tw" for c in batch]
+                + (index_ex_list if batch_idx == 0 else [])
+            )
 
-        try:
-            data = r.json()
-        except json.JSONDecodeError:
-            state.error = "抓取失敗: 證交所未回傳標準資料 (可能受到暫時性限制)"
-            return result, twse_times
+            r = requests.get(
+                URL,
+                params={"ex_ch": ex, "json": 1, "delay": 0},
+                headers=HEADERS,
+                timeout=10,
+            )
 
-        state.error = ""
+            if r.status_code != 200:
+                state.error = f"抓取失敗: 證交所拒絕連線 (HTTP {r.status_code})"
+                return result, twse_times
 
-        for i in data.get("msgArray", []):
-            c = i.get("c")
-            if not c:
-                continue
+            try:
+                data = r.json()
+            except json.JSONDecodeError:
+                state.error = "抓取失敗: 證交所未回傳標準資料 (可能受到暫時性限制)"
+                return result, twse_times
 
-            prev = safe_float(i.get("y"))
+            state.error = ""
 
-            if prev > 0:
-                state._y_cache[c] = prev
-            elif c in state._y_cache:
-                prev = state._y_cache[c]
+            for i in data.get("msgArray", []):
+                c = i.get("c")
+                if not c or c in result:
+                    continue
 
-            price = safe_float(i.get("z"))
+                prev = safe_float(i.get("y"))
 
-            if price == 0:
-                price = safe_float(i.get("tv"))
+                if prev > 0:
+                    state._y_cache[c] = prev
+                elif c in state._y_cache:
+                    prev = state._y_cache[c]
 
-            open_p = safe_float(i.get("o"))
-            high_p = safe_float(i.get("h"))
-            low_p  = safe_float(i.get("l"))
+                price = safe_float(i.get("z"))
 
-            if price == 0 and c in state._price_cache:
-                price = state._price_cache[c]
+                if price == 0:
+                    price = safe_float(i.get("tv"))
 
-            if price > 0:
-                state._price_cache[c] = price
+                open_p = safe_float(i.get("o"))
+                high_p = safe_float(i.get("h"))
+                low_p  = safe_float(i.get("l"))
 
-            # 修正：prev 為 0 時僅以昨收快取補值，不以開盤價替代，避免漲跌計算錯誤
-            if prev == 0 and c in state._y_cache:
-                prev = state._y_cache[c]
+                if price == 0 and c in state._price_cache:
+                    price = state._price_cache[c]
 
-            if price > 0 and prev > 0:
-                chg = round(price - prev, 2)
-                pct = round(chg / prev * 100, 2) if prev else 0
-            else:
-                chg = 0
-                pct = 0
+                if price > 0:
+                    state._price_cache[c] = price
 
-            if high_p == 0 and price > 0:
-                high_p = price
-            if low_p == 0 and price > 0:
-                low_p = price
+                if prev == 0 and c in state._y_cache:
+                    prev = state._y_cache[c]
 
-            t = i.get("t")
-            if t:
-                twse_times.append(t)
+                if price > 0 and prev > 0:
+                    chg = round(price - prev, 2)
+                    pct = round(chg / prev * 100, 2) if prev else 0
+                else:
+                    chg = 0
+                    pct = 0
 
-            prev_close = prev
-            volume     = safe_float(i.get("v"))
+                if high_p == 0 and price > 0:
+                    high_p = price
+                if low_p == 0 and price > 0:
+                    low_p = price
 
-            if prev_close > 0 and high_p > 0 and low_p > 0:
-                amplitude = round((high_p - low_p) / prev_close * 100, 2)
-            else:
-                amplitude = 0
+                t = i.get("t")
+                if t:
+                    twse_times.append(t)
 
-            bid_prices = parse_five(i.get("b", ""))
-            bid_vols   = parse_five(i.get("g", ""))
-            ask_prices = parse_five(i.get("f", ""))
-            ask_vols   = parse_five(i.get("g", ""))
+                prev_close = prev
+                volume     = safe_float(i.get("v"))
 
-            prev_tick = state._prev_tick_price.get(c, 0)
-            if prev_tick > 0 and price > 0:
-                tick_chg_pct = (price - prev_tick) / prev_tick * 100
-                abs_tick_chg_pct = abs(tick_chg_pct)
-            else:
-                tick_chg_pct = 0
-                abs_tick_chg_pct = 0
+                if prev_close > 0 and high_p > 0 and low_p > 0:
+                    amplitude = round((high_p - low_p) / prev_close * 100, 2)
+                else:
+                    amplitude = 0
 
-            if price > 0:
-                state._prev_tick_price[c] = price
+                bid_prices = parse_five(i.get("b", ""))
+                bid_vols   = parse_five(i.get("g", ""))
+                ask_prices = parse_five(i.get("f", ""))
+                ask_vols   = parse_five(i.get("g", ""))
 
-            now_ts = time.time()
-            if abs_tick_chg_pct >= 1:
-                state._alert_time[c] = now_ts
-                # 紀錄變動方向：up 表示上漲，down 表示下跌
-                state._alert_dir[c] = "up" if tick_chg_pct > 0 else "down"
-            elif c in state._alert_time:
-                if now_ts - state._alert_time[c] >= 300:
-                    del state._alert_time[c]
-                    if c in state._alert_dir:
-                        del state._alert_dir[c]
+                prev_tick = state._prev_tick_price.get(c, 0)
+                if prev_tick > 0 and price > 0:
+                    tick_chg_pct = (price - prev_tick) / prev_tick * 100
+                    abs_tick_chg_pct = abs(tick_chg_pct)
+                else:
+                    tick_chg_pct = 0
+                    abs_tick_chg_pct = 0
 
-            result[c] = {
-                "name":       i.get("n", ""),
-                "price":      price,
-                "prev_close": prev_close,
-                "chg":        chg,
-                "pct":        pct,
-                "open":       open_p,
-                "high":       high_p,
-                "low":        low_p,
-                "volume":     volume,
-                "amplitude":  amplitude,
-                "alert":      c in state._alert_time,
-                "alert_dir":  state._alert_dir.get(c, ""),
-                "bid_prices": bid_prices,
-                "bid_vols":   bid_vols,
-                "ask_prices": ask_prices,
-                "ask_vols":   ask_vols,
-                "time":       t,
-                "code":       c,
-            }
+                if price > 0:
+                    state._prev_tick_price[c] = price
+
+                now_ts = time.time()
+                if abs_tick_chg_pct >= 1:
+                    state._alert_time[c] = now_ts
+                    state._alert_dir[c] = "up" if tick_chg_pct > 0 else "down"
+                elif c in state._alert_time:
+                    if now_ts - state._alert_time[c] >= 300:
+                        del state._alert_time[c]
+                        if c in state._alert_dir:
+                            del state._alert_dir[c]
+
+                result[c] = {
+                    "name":       i.get("n", ""),
+                    "price":      price,
+                    "prev_close": prev_close,
+                    "chg":        chg,
+                    "pct":        pct,
+                    "open":       open_p,
+                    "high":       high_p,
+                    "low":        low_p,
+                    "volume":     volume,
+                    "amplitude":  amplitude,
+                    "alert":      c in state._alert_time,
+                    "alert_dir":  state._alert_dir.get(c, ""),
+                    "bid_prices": bid_prices,
+                    "bid_vols":   bid_vols,
+                    "ask_prices": ask_prices,
+                    "ask_vols":   ask_vols,
+                    "time":       t,
+                    "code":       c,
+                }
+
+        state.bad_codes = [
+            c for c in WATCH_LIST
+            if c not in result and c not in ETF_CODES
+        ]
 
     except Exception as e:
         state.error = f"抓取失敗: {e}"
@@ -417,23 +393,15 @@ def refresh(state: StockState) -> None:
                 state.twse_time = twse_times[0]
 
 
-# --- Excel 寫入 ------------------------------
+# --- 歷史資料寫入（CSV 安全寫入）-------------
 
 def push_to_sheet(state: StockState):
     today = now_tpe().strftime("%Y-%m-%d")
 
-    # 在鎖保護下取出 snapshot，取完立即釋放，避免長時間持鎖阻塞 GUI 讀取
     with state._data_lock:
         data_snapshot = dict(state.data)
 
-    if not os.path.exists(EXCEL_FILE):
-        state._init_excel_file()
-
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-    except Exception as e:
-        state.error = f"開啟 Excel 檔案失敗: {e}"
-        return
+    os.makedirs(HISTORY_CSV_DIR, exist_ok=True)
 
     combined_watch_list = list(set(WATCH_LIST).union(ETF_CODES))
     all_codes = combined_watch_list + [i["code"] for i in INDEX_LIST]
@@ -443,70 +411,66 @@ def push_to_sheet(state: StockState):
             d = data_snapshot.get(c)
             if not d or not d.get("time"):
                 continue
-
             if d["price"] == 0:
                 continue
 
-            sheet_name = c
-            stock_name = d.get("name", c)
-            for idx_info in INDEX_LIST:
-                if idx_info["code"] == c:
-                    sheet_name = idx_info["sheet"]
-                    stock_name = idx_info["name"]
-                    break
+            csv_path = os.path.join(HISTORY_CSV_DIR, f"{c}.csv")
+            header = ["日期", "開盤價", "最高價", "最低價", "收盤價", "漲跌", "漲跌幅(%)"]
 
-            ws = state.get_worksheet(wb, sheet_name, stock_name)
-            meta = state.get_sheet_meta(ws, today)
+            rows = []
+            last_date = None
+            if os.path.exists(csv_path):
+                with open(csv_path, newline="", encoding="utf-8-sig") as f:
+                    reader = csv.reader(f)
+                    next(reader, None)
+                    for row in reader:
+                        if row:
+                            rows.append(row)
+                            last_date = row[0] if row[0] else None
 
             target_open = d["open"]
             target_high = d["high"]
             target_low  = d["low"]
 
-            if meta["date"] == today:
+            if last_date == today and rows:
+                last_row = rows[-1]
                 try:
-                    ext_open = safe_float(ws.cell(row=meta["row"], column=2).value)
-                    ext_high = safe_float(ws.cell(row=meta["row"], column=3).value)
-                    ext_low  = safe_float(ws.cell(row=meta["row"], column=4).value)
+                    ext_open = float(last_row[1]) if last_row[1] else 0
+                    ext_high = float(last_row[2]) if last_row[2] else 0
+                    ext_low  = float(last_row[3]) if last_row[3] else 0
                     if ext_open > 0:
                         target_open = ext_open
                     if ext_high > 0:
                         target_high = max(ext_high, target_high)
-                    if ext_low > 0:
-                        target_low = min(ext_low, target_low) if target_low > 0 else ext_low
-                except Exception as e:
-                    state.error = f"讀取現有極值失敗 ({c}): {e}"
+                    if target_low > 0 and ext_low > 0:
+                        target_low = min(ext_low, target_low)
+                    elif ext_low > 0:
+                        target_low = ext_low
+                except (ValueError, IndexError):
+                    pass
 
-            row_data = [
-                today,
-                target_open,
-                target_high,
-                target_low,
-                d["price"],
-                d["chg"],
-                d["pct"],
-            ]
+            new_row = [today, target_open, target_high, target_low, d["price"], d["chg"], d["pct"]]
 
-            # 修正：cache key 改用股票代碼而非 sheet_name，避免代碼與工作表名稱同名時衝突
             cache_key = f"hist_code_{c}"
-            if state._history_row_cache.get(cache_key) == row_data:
+            if state._history_row_cache.get(cache_key) == new_row:
                 continue
 
-            if meta["date"] == today:
-                for col_idx, val in enumerate(row_data, start=1):
-                    ws.cell(row=meta["row"], column=col_idx, value=val)
+            if last_date == today and rows:
+                rows[-1] = new_row
             else:
-                ws.append(row_data)
+                rows.append(new_row)
 
-            state._history_row_cache[cache_key] = row_data
+            tmp_path = csv_path + ".tmp"
+            with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+            os.replace(tmp_path, csv_path)
+
+            state._history_row_cache[cache_key] = new_row
 
         except Exception as e:
             state.error = f"歷史寫入失敗 ({c}): {e}"
-
-    try:
-        wb.save(EXCEL_FILE)
-        wb.close()
-    except Exception as e:
-        state.error = f"儲存 Excel 檔案失敗 (請檢查是否被其他程式開啟): {e}"
 
 
 def trigger_sheet_write(state: StockState):
@@ -519,7 +483,7 @@ def trigger_sheet_write(state: StockState):
         try:
             push_to_sheet(state)
         except Exception as e:
-            state.error = f"Excel 寫入執行緒失敗: {e}"
+            state.error = f"歷史資料寫入執行緒失敗: {e}"
         finally:
             with state._sheet_lock:
                 state._sheet_writing = False
@@ -702,7 +666,7 @@ class StockApp:
         self.update_gui_loop()
 
     def start_background_loop(self):
-        """獨立執行緒：專職處理網路請求、每分鐘寫入 CSV 與每 10 分鐘寫入 Excel 歷史資料"""
+        """獨立執行緒：專職處理網路請求、每分鐘寫入即時 CSV 與每 10 分鐘寫入歷史 CSV"""
         def _loop():
             last_csv_time = 0.0
             last_excel_time = 0.0
@@ -728,7 +692,7 @@ class StockApp:
                     trigger_csv_write(self.state)
                     last_csv_time = current_now
                     
-                # 判斷是否觸發每 10 分鐘 Excel 歷史寫入
+                # 判斷是否觸發每 10 分鐘歷史資料寫入
                 if current_now - last_excel_time >= excel_interval:
                     trigger_sheet_write(self.state)
                     last_excel_time = current_now
@@ -794,14 +758,15 @@ class StockApp:
         # 1. 更新上方狀態列
         writing_hint = ""
         if self.state._sheet_writing:
-            writing_hint = " [Excel歷史寫入中...]"
+            writing_hint = " [歷史資料寫入中...]"
         elif self.state._csv_writing:
             writing_hint = " [CSV即時寫入中...]"
             
         err_msg = f"\n錯誤訊息: {self.state.error}" if self.state.error else ""
+        bad_msg = f" ⚠ 找不到股號: {', '.join(self.state.bad_codes)}" if self.state.bad_codes else ""
         status_text = (
             f" 本機時間：{self.state.local_time}   |   "
-            f"交易所時間：{self.state.twse_time or '—'}{writing_hint}{err_msg}"
+            f"交易所時間：{self.state.twse_time or '—'}{writing_hint}{err_msg}{bad_msg}"
         )
         self.status_label.config(text=status_text)
         
