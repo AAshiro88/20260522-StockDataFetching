@@ -14,3 +14,4 @@
 *.jpg
 # 排除例外：唯獨允許追蹤此 template 檔案（前方加上驚嘆號）
 !個股股價 - template.xlsx
+!main.xlsx
