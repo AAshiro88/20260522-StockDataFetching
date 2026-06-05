@@ -258,149 +258,167 @@ def parse_five(raw: str) -> list:
     return values
 
 
+def _parse_stock_msg(state: StockState, msg: dict, twse_times: list):
+    """解析單筆 msgArray 元素，回傳 (code, record_dict) 或 None"""
+    c = msg.get("c")
+    if not c:
+        return None
+
+    prev = safe_float(msg.get("y"))
+    if prev > 0:
+        state._y_cache[c] = prev
+    elif c in state._y_cache:
+        prev = state._y_cache[c]
+
+    price = safe_float(msg.get("z"))
+    if price == 0:
+        price = safe_float(msg.get("tv"))
+    if price == 0 and c in state._price_cache:
+        price = state._price_cache[c]
+    if price > 0:
+        state._price_cache[c] = price
+
+    open_p = safe_float(msg.get("o"))
+    high_p = safe_float(msg.get("h"))
+    low_p  = safe_float(msg.get("l"))
+
+    if prev == 0 and c in state._y_cache:
+        prev = state._y_cache[c]
+
+    if price > 0 and prev > 0:
+        chg = round(price - prev, 2)
+        pct = round(chg / prev * 100, 2) if prev else 0
+    else:
+        chg = 0
+        pct = 0
+
+    if high_p == 0 and price > 0:
+        high_p = price
+    if low_p == 0 and price > 0:
+        low_p = price
+
+    t = msg.get("t")
+    if t:
+        twse_times.append(t)
+
+    prev_close = prev
+    volume = safe_float(msg.get("v"))
+
+    if prev_close > 0 and high_p > 0 and low_p > 0:
+        amplitude = round((high_p - low_p) / prev_close * 100, 2)
+    else:
+        amplitude = 0
+
+    bid_prices = parse_five(msg.get("b", ""))
+    bid_vols   = parse_five(msg.get("g", ""))
+    ask_prices = parse_five(msg.get("f", ""))
+    ask_vols   = parse_five(msg.get("g", ""))
+
+    prev_tick = state._prev_tick_price.get(c, 0)
+    if prev_tick > 0 and price > 0:
+        tick_chg_pct = (price - prev_tick) / prev_tick * 100
+        abs_tick_chg_pct = abs(tick_chg_pct)
+    else:
+        tick_chg_pct = 0
+        abs_tick_chg_pct = 0
+
+    if price > 0:
+        state._prev_tick_price[c] = price
+
+    now_ts = time.time()
+    if abs_tick_chg_pct >= 1:
+        state._alert_time[c] = now_ts
+        state._alert_dir[c] = "up" if tick_chg_pct > 0 else "down"
+    elif c in state._alert_time:
+        if now_ts - state._alert_time[c] >= 300:
+            del state._alert_time[c]
+            if c in state._alert_dir:
+                del state._alert_dir[c]
+
+    return c, {
+        "name":       msg.get("n", ""),
+        "price":      price,
+        "prev_close": prev_close,
+        "chg":        chg,
+        "pct":        pct,
+        "open":       open_p,
+        "high":       high_p,
+        "low":        low_p,
+        "volume":     volume,
+        "amplitude":  amplitude,
+        "alert":      c in state._alert_time,
+        "alert_dir":  state._alert_dir.get(c, ""),
+        "bid_prices": bid_prices,
+        "bid_vols":   bid_vols,
+        "ask_prices": ask_prices,
+        "ask_vols":   ask_vols,
+        "time":       t,
+        "code":       c,
+    }
+
+
+def _fetch_batch(state: StockState, ex_ch: str, twse_times: list) -> dict:
+    """對單一 ex_ch 字串發送請求，回傳該批解析後的 result dict"""
+    result = {}
+    try:
+        time.sleep(random.uniform(0.3, 0.5))
+        r = requests.get(
+            URL,
+            params={"ex_ch": ex_ch, "json": 1, "delay": 0},
+            headers=HEADERS,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            state.error = f"批次請求失敗 (HTTP {r.status_code})"
+            return result
+
+        try:
+            data = r.json()
+        except json.JSONDecodeError:
+            state.error = "批次回應非標準 JSON"
+            return result
+
+        for msg in data.get("msgArray", []):
+            parsed = _parse_stock_msg(state, msg, twse_times)
+            if parsed:
+                c, record = parsed
+                result[c] = record
+
+    except Exception as e:
+        state.error = f"批次請求異常: {e}"
+
+    return result
+
+
 def fetch(state: StockState) -> tuple[dict, list[str]]:
     result = {}
     twse_times = []
 
     combined_watch_list = list(set(WATCH_LIST).union(ETF_CODES))
 
-    # 修正：動態判斷指數代碼，o00 開頭使用 otc_ 市場別，其餘使用 tse_ 市場別
+    # 指數 ex_ch
     index_ex_list = []
     for i in INDEX_LIST:
         prefix = "otc" if i["code"].startswith("o") else "tse"
         index_ex_list.append(f"{prefix}_{i['code']}.tw")
+    index_ex_ch = "|".join(index_ex_list)
 
-    ex = "|".join(
-        [f"tse_{c}.tw|otc_{c}.tw" for c in combined_watch_list]
-        + index_ex_list
-    )
+    state.error = ""
 
-    try:
-        time.sleep(random.uniform(0.2, 0.5))
-        r = requests.get(
-            URL,
-            params={"ex_ch": ex, "json": 1, "delay": 0},
-            headers=HEADERS,
-            timeout=10,
-        )
+    # 1) 先抓指數（少量）
+    if index_ex_list:
+        result.update(_fetch_batch(state, index_ex_ch, twse_times))
 
-        if r.status_code != 200:
-            state.error = f"抓取失敗: 證交所拒絕連線 (HTTP {r.status_code})"
-            return result, twse_times
+    # 2) 分批抓個股/ETF，每批 50 檔
+    batch_size = 50
+    for batch_start in range(0, len(combined_watch_list), batch_size):
+        batch = combined_watch_list[batch_start:batch_start + batch_size]
+        ex_ch = "|".join(f"tse_{c}.tw|otc_{c}.tw" for c in batch)
+        batch_result = _fetch_batch(state, ex_ch, twse_times)
+        result.update(batch_result)
 
-        try:
-            data = r.json()
-        except json.JSONDecodeError:
-            state.error = "抓取失敗: 證交所未回傳標準資料 (可能受到暫時性限制)"
-            return result, twse_times
-
-        state.error = ""
-
-        for i in data.get("msgArray", []):
-            c = i.get("c")
-            if not c:
-                continue
-
-            prev = safe_float(i.get("y"))
-
-            if prev > 0:
-                state._y_cache[c] = prev
-            elif c in state._y_cache:
-                prev = state._y_cache[c]
-
-            price = safe_float(i.get("z"))
-
-            if price == 0:
-                price = safe_float(i.get("tv"))
-
-            open_p = safe_float(i.get("o"))
-            high_p = safe_float(i.get("h"))
-            low_p  = safe_float(i.get("l"))
-
-            if price == 0 and c in state._price_cache:
-                price = state._price_cache[c]
-
-            if price > 0:
-                state._price_cache[c] = price
-
-            # 修正：prev 為 0 時僅以昨收快取補值，不以開盤價替代，避免漲跌計算錯誤
-            if prev == 0 and c in state._y_cache:
-                prev = state._y_cache[c]
-
-            if price > 0 and prev > 0:
-                chg = round(price - prev, 2)
-                pct = round(chg / prev * 100, 2) if prev else 0
-            else:
-                chg = 0
-                pct = 0
-
-            if high_p == 0 and price > 0:
-                high_p = price
-            if low_p == 0 and price > 0:
-                low_p = price
-
-            t = i.get("t")
-            if t:
-                twse_times.append(t)
-
-            prev_close = prev
-            volume     = safe_float(i.get("v"))
-
-            if prev_close > 0 and high_p > 0 and low_p > 0:
-                amplitude = round((high_p - low_p) / prev_close * 100, 2)
-            else:
-                amplitude = 0
-
-            bid_prices = parse_five(i.get("b", ""))
-            bid_vols   = parse_five(i.get("g", ""))
-            ask_prices = parse_five(i.get("f", ""))
-            ask_vols   = parse_five(i.get("g", ""))
-
-            prev_tick = state._prev_tick_price.get(c, 0)
-            if prev_tick > 0 and price > 0:
-                tick_chg_pct = (price - prev_tick) / prev_tick * 100
-                abs_tick_chg_pct = abs(tick_chg_pct)
-            else:
-                tick_chg_pct = 0
-                abs_tick_chg_pct = 0
-
-            if price > 0:
-                state._prev_tick_price[c] = price
-
-            now_ts = time.time()
-            if abs_tick_chg_pct >= 1:
-                state._alert_time[c] = now_ts
-                # 紀錄變動方向：up 表示上漲，down 表示下跌
-                state._alert_dir[c] = "up" if tick_chg_pct > 0 else "down"
-            elif c in state._alert_time:
-                if now_ts - state._alert_time[c] >= 300:
-                    del state._alert_time[c]
-                    if c in state._alert_dir:
-                        del state._alert_dir[c]
-
-            result[c] = {
-                "name":       i.get("n", ""),
-                "price":      price,
-                "prev_close": prev_close,
-                "chg":        chg,
-                "pct":        pct,
-                "open":       open_p,
-                "high":       high_p,
-                "low":        low_p,
-                "volume":     volume,
-                "amplitude":  amplitude,
-                "alert":      c in state._alert_time,
-                "alert_dir":  state._alert_dir.get(c, ""),
-                "bid_prices": bid_prices,
-                "bid_vols":   bid_vols,
-                "ask_prices": ask_prices,
-                "ask_vols":   ask_vols,
-                "time":       t,
-                "code":       c,
-            }
-
-    except Exception as e:
-        state.error = f"抓取失敗: {e}"
+    if not result:
+        state.error = state.error or "抓取失敗：無任何資料回傳"
 
     return result, twse_times
 
