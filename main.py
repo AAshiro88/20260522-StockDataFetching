@@ -551,6 +551,9 @@ def push_to_csv(state: StockState):
             "委賣價5", "委賣量5",
         ]
 
+        # 分隔列：第一欄以短橫線標示區隔，其餘欄位留空以維持與表頭相同的欄數
+        separator = ["----------------"] + [""] * (len(headers) - 1)
+
         def build_rt_row(label: str, d: dict) -> list:
             bid_cols = []
             ask_cols = []
@@ -574,18 +577,27 @@ def push_to_csv(state: StockState):
                 *ask_cols,
             ]
 
+        # 指數區：依 INDEX_LIST 順序輸出加權指數與櫃買指數
         for idx_info in INDEX_LIST:
             d = data_snapshot.get(idx_info["code"])
             if d and d["price"] > 0:
                 rows.append(build_rt_row(idx_info["name"], d))
 
-        for c in WATCH_LIST:
+        # 指數與 ETF 之間的分隔列
+        rows.append(separator)
+
+        # ETF 區：依代碼升冪排序輸出
+        for c in sorted(list(ETF_CODES)):
             d = data_snapshot.get(c)
             if d and d["price"] > 0:
                 label = f"{d['name']}({c})" if d["name"] else c
                 rows.append(build_rt_row(label, d))
 
-        for c in sorted(list(ETF_CODES)):
+        # ETF 與個股之間的分隔列
+        rows.append(separator)
+
+        # 個股區：依 WATCH_LIST 原始順序輸出
+        for c in WATCH_LIST:
             d = data_snapshot.get(c)
             if d and d["price"] > 0:
                 label = f"{d['name']}({c})" if d["name"] else c
