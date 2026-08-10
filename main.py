@@ -552,7 +552,7 @@ def push_to_csv(state: StockState):
         ]
 
         # 分隔列：第一欄以短橫線標示區隔，其餘欄位留空以維持與表頭相同的欄數
-        separator = ["----------------"] + [""] * (len(headers) - 1)
+        separator = ["-" * 100] + [""] * (len(headers) - 1)
 
         def build_rt_row(label: str, d: dict) -> list:
             bid_cols = []
